@@ -1,0 +1,344 @@
+// Package tdf parses TheDraw Font (.tdf) files and renders text using them.
+//
+// Format summary:
+//   - 20-byte file signature + 4 magic bytes
+//   - One or more font records, each containing:
+//       • 1-byte name length + N-byte name (null-padded)
+//       • 6 bytes of metadata (type, letter spacing, block size, …)
+//       • 95 × 2-byte LE offset table (chars 32–126; 0xFFFF = undefined)
+//       • Character data section (offsets are relative to this section's start)
+//   - Each character: 2-byte (width, height) preamble,
+//       then rows of (cp437_char, cga_attr) pairs,
+//       0x0D row delimiter, 0x00 character terminator.
+//   - Upper and lowercase letters share the same glyphs.
+//   - Space (char 32) offset points past end of char data — no glyph; use SpaceWidth.
+package tdf
+
+import (
+	"encoding/binary"
+	"fmt"
+	"strings"
+
+	"github.com/charmbracelet/lipgloss"
+)
+
+const fileSig = "\x13TheDraw FONTS file\x1a"
+
+// numChars is the number of characters in the offset table (ASCII 33–126 inclusive).
+// Space (32) is not in the table; its width is derived from the other glyphs.
+const numChars = 94
+
+// firstChar is the first ASCII value present in the offset table.
+const firstChar = 33
+
+// Cell is one character cell: a CP437 byte and a CGA attribute byte.
+// Attribute byte: bits 0–3 = foreground color index, bits 4–6 = background color index.
+type Cell struct {
+	Char byte
+	Attr byte
+}
+
+// Glyph holds the cell grid for one character.
+type Glyph struct {
+	Width  int
+	Height int
+	Rows   [][]Cell
+}
+
+// Font is a parsed TheDraw font.
+type Font struct {
+	Name          string
+	Type          byte // 0=Outline, 1=Block, 2=Color
+	LetterSpacing int
+	SpaceWidth    int // columns to emit for ASCII space (derived from context)
+	glyphs        [numChars]*Glyph
+}
+
+// Glyph returns the glyph for rune r, trying the opposite case as a fallback.
+// Returns nil if the character is not defined.
+func (f *Font) Glyph(r rune) *Glyph {
+	if g := f.glyphDirect(r); g != nil {
+		return g
+	}
+	// Case fallback: TDF fonts often define only one case.
+	if r >= 'a' && r <= 'z' {
+		return f.glyphDirect(r - 32)
+	}
+	if r >= 'A' && r <= 'Z' {
+		return f.glyphDirect(r + 32)
+	}
+	return nil
+}
+
+func (f *Font) glyphDirect(r rune) *Glyph {
+	idx := int(r) - firstChar
+	if idx < 0 || idx >= numChars {
+		return nil
+	}
+	return f.glyphs[idx]
+}
+
+// ParseFile parses a .tdf file and returns all fonts it contains.
+func ParseFile(data []byte) ([]*Font, error) {
+	if len(data) < len(fileSig)+4 {
+		return nil, fmt.Errorf("tdf: file too short")
+	}
+	if string(data[:len(fileSig)]) != fileSig {
+		return nil, fmt.Errorf("tdf: invalid file signature")
+	}
+
+	pos := len(fileSig) // skip 20-byte sig; each font record has its own 4-byte magic prefix
+
+	var fonts []*Font
+	for pos < len(data) {
+		font, n, err := parseFont(data, pos)
+		if err != nil {
+			return nil, fmt.Errorf("tdf: font at offset %d: %w", pos, err)
+		}
+		fonts = append(fonts, font)
+		pos += n
+	}
+	return fonts, nil
+}
+
+func parseFont(data []byte, base int) (*Font, int, error) {
+	pos := base
+
+	// Each font record begins with a 4-byte magic prefix (55 aa 00 ff).
+	if pos+4 > len(data) {
+		return nil, 0, fmt.Errorf("unexpected EOF before font magic")
+	}
+	pos += 4
+
+	// Name: 1-byte length prefix (for display) + 12-byte null-padded field.
+	// The field is always 12 bytes regardless of the length prefix value.
+	if pos+1+12 > len(data) {
+		return nil, 0, fmt.Errorf("name truncated")
+	}
+	pos++ // skip length prefix
+	name := strings.TrimRight(string(data[pos:pos+12]), "\x00")
+	pos += 12
+
+	// Metadata: 8 bytes (file offsets 37–44).
+	//   Bytes 0–3: padding, unused.
+	//   Byte  4:   font type (00=Outline, 01=Block, 02=Color).
+	//   Byte  5:   letter spacing (0–40).
+	//   Bytes 6–7: block size, LE uint16 = total byte length of char data section.
+	if pos+8 > len(data) {
+		return nil, 0, fmt.Errorf("metadata truncated")
+	}
+	fontType := data[pos+4]
+	letterSpacing := int(data[pos+5])
+	charDataSize := int(binary.LittleEndian.Uint16(data[pos+6:]))
+	pos += 8
+
+	// Offset table: 94 × 2-byte LE values, ASCII 33–126.
+	// 0xFFFF = character not defined.
+	if pos+numChars*2 > len(data) {
+		return nil, 0, fmt.Errorf("offset table truncated")
+	}
+	var offsets [numChars]uint16
+	for i := range offsets {
+		offsets[i] = binary.LittleEndian.Uint16(data[pos+i*2:])
+	}
+	charDataBase := pos + numChars*2 // = 233
+
+	font := &Font{
+		Name:          name,
+		Type:          fontType,
+		LetterSpacing: letterSpacing,
+	}
+
+	// Parse glyphs. charDataSize (from the block size header field) bounds the
+	// section so we don't walk into the next font's data.
+	maxEnd := charDataBase + charDataSize
+	for i, off := range offsets {
+		if off == 0xFFFF || int(off) >= charDataSize {
+			continue
+		}
+		abs := charDataBase + int(off)
+		if abs+2 > len(data) {
+			continue
+		}
+		g, _, err := parseGlyph(data, abs)
+		if err != nil {
+			continue
+		}
+		font.glyphs[i] = g
+	}
+
+	// Derive a reasonable space width from the average glyph width.
+	font.SpaceWidth = spaceWidth(font)
+
+	return font, maxEnd - base, nil
+}
+
+func spaceWidth(f *Font) int {
+	total, count := 0, 0
+	for _, g := range f.glyphs {
+		if g != nil {
+			total += g.Width
+			count++
+		}
+	}
+	if count == 0 {
+		return 2
+	}
+	return total / count
+}
+
+func parseGlyph(data []byte, pos int) (*Glyph, int, error) {
+	if pos+2 > len(data) {
+		return nil, 0, fmt.Errorf("glyph preamble truncated")
+	}
+	width := int(data[pos])
+	height := int(data[pos+1])
+	pos += 2
+
+	g := &Glyph{Width: width, Height: height}
+	var row []Cell
+
+	for pos < len(data) {
+		b := data[pos]
+		pos++
+		switch b {
+		case 0x00:
+			if len(row) > 0 {
+				g.Rows = append(g.Rows, row)
+			}
+			return g, pos, nil
+		case 0x0D:
+			g.Rows = append(g.Rows, row)
+			row = nil
+		default:
+			if pos >= len(data) {
+				return nil, 0, fmt.Errorf("glyph attr byte missing")
+			}
+			attr := data[pos]
+			pos++
+			row = append(row, Cell{Char: b, Attr: attr})
+		}
+	}
+	return nil, 0, fmt.Errorf("glyph not terminated")
+}
+
+// RenderString renders s using f and returns a multi-line ANSI-colored string,
+// one terminal line per glyph row. Characters not in the font are skipped;
+// spaces are rendered as blank columns. letterSpacing blank columns are
+// inserted between each pair of adjacent glyphs.
+func RenderString(f *Font, s string, letterSpacing int) string {
+	runes := []rune(s)
+	glyphs := make([]*Glyph, len(runes))
+	height := 0
+	for i, r := range runes {
+		if r == ' ' {
+			continue
+		}
+		g := f.Glyph(r)
+		glyphs[i] = g
+		if g != nil && g.Height > height {
+			height = g.Height
+		}
+	}
+	if height == 0 {
+		return ""
+	}
+
+	lines := make([]string, height)
+	for row := 0; row < height; row++ {
+		var b strings.Builder
+		first := true
+		for i, r := range runes {
+			g := glyphs[i]
+			if r == ' ' || g == nil {
+				if !first {
+					b.WriteString(strings.Repeat(" ", letterSpacing))
+				}
+				b.WriteString(strings.Repeat(" ", f.SpaceWidth))
+				first = false
+				continue
+			}
+			if !first && letterSpacing > 0 {
+				b.WriteString(strings.Repeat(" ", letterSpacing))
+			}
+			first = false
+			if row >= len(g.Rows) {
+				b.WriteString(strings.Repeat(" ", g.Width))
+				continue
+			}
+			for _, cell := range g.Rows[row] {
+				fg := cgaColor(cell.Attr & 0x0F)
+				bg := cgaColor((cell.Attr >> 4) & 0x07)
+				ch := cp437Rune(cell.Char)
+				b.WriteString(lipgloss.NewStyle().Foreground(fg).Background(bg).Render(string(ch)))
+			}
+		}
+		lines[row] = b.String()
+	}
+	return strings.Join(lines, "\n")
+}
+
+// cgaColor maps a 4-bit CGA color index to a lipgloss Color.
+func cgaColor(idx byte) lipgloss.Color {
+	palette := [16]lipgloss.Color{
+		"#000000", "#0000AA", "#00AA00", "#00AAAA",
+		"#AA0000", "#AA00AA", "#AA5500", "#AAAAAA",
+		"#555555", "#5555FF", "#55FF55", "#55FFFF",
+		"#FF5555", "#FF55FF", "#FFFF55", "#FFFFFF",
+	}
+	if idx > 15 {
+		return palette[7]
+	}
+	return palette[idx]
+}
+
+// cp437Rune maps a CP437 byte to its Unicode equivalent.
+// Only the graphical/block characters common in TDF fonts are mapped;
+// everything else falls back to the Unicode CP437 range (U+F000+).
+func cp437Rune(b byte) rune {
+	// Common block-drawing and shading characters used in TDF fonts.
+	cp437 := map[byte]rune{
+		0x00: ' ',
+		0x01: '☺', 0x02: '☻', 0x03: '♥', 0x04: '♦', 0x05: '♣', 0x06: '♠',
+		0x07: '•', 0x08: '◘', 0x09: '○', 0x0A: '◙', 0x0B: '♂', 0x0C: '♀',
+		0x0D: '♪', 0x0E: '♫', 0x0F: '☼',
+		0x10: '►', 0x11: '◄', 0x12: '↕', 0x13: '‼', 0x14: '¶', 0x15: '§',
+		0x16: '▬', 0x17: '↨', 0x18: '↑', 0x19: '↓', 0x1A: '→', 0x1B: '←',
+		0x1C: '∟', 0x1D: '↔', 0x1E: '▲', 0x1F: '▼',
+		0x20: ' ',
+		// 0x21–0x7E are standard ASCII, handled below.
+		0x7F: '⌂',
+		0x80: 'Ç', 0x81: 'ü', 0x82: 'é', 0x83: 'â', 0x84: 'ä', 0x85: 'à',
+		0x86: 'å', 0x87: 'ç', 0x88: 'ê', 0x89: 'ë', 0x8A: 'è', 0x8B: 'ï',
+		0x8C: 'î', 0x8D: 'ì', 0x8E: 'Ä', 0x8F: 'Å',
+		0x90: 'É', 0x91: 'æ', 0x92: 'Æ', 0x93: 'ô', 0x94: 'ö', 0x95: 'ò',
+		0x96: 'û', 0x97: 'ù', 0x98: 'ÿ', 0x99: 'Ö', 0x9A: 'Ü', 0x9B: '¢',
+		0x9C: '£', 0x9D: '¥', 0x9E: '₧', 0x9F: 'ƒ',
+		0xA0: 'á', 0xA1: 'í', 0xA2: 'ó', 0xA3: 'ú', 0xA4: 'ñ', 0xA5: 'Ñ',
+		0xA6: 'ª', 0xA7: 'º', 0xA8: '¿', 0xA9: '⌐', 0xAA: '¬', 0xAB: '½',
+		0xAC: '¼', 0xAD: '¡', 0xAE: '«', 0xAF: '»',
+		0xB0: '░', 0xB1: '▒', 0xB2: '▓',
+		0xB3: '│', 0xB4: '┤', 0xB5: '╡', 0xB6: '╢', 0xB7: '╖', 0xB8: '╕',
+		0xB9: '╣', 0xBA: '║', 0xBB: '╗', 0xBC: '╝', 0xBD: '╜', 0xBE: '╛',
+		0xBF: '┐',
+		0xC0: '└', 0xC1: '┴', 0xC2: '┬', 0xC3: '├', 0xC4: '─', 0xC5: '┼',
+		0xC6: '╞', 0xC7: '╟', 0xC8: '╚', 0xC9: '╔', 0xCA: '╩', 0xCB: '╦',
+		0xCC: '╠', 0xCD: '═', 0xCE: '╬', 0xCF: '╧',
+		0xD0: '╨', 0xD1: '╤', 0xD2: '╥', 0xD3: '╙', 0xD4: '╘', 0xD5: '╒',
+		0xD6: '╓', 0xD7: '╫', 0xD8: '╪', 0xD9: '┘', 0xDA: '┌',
+		0xDB: '█', 0xDC: '▄', 0xDD: '▌', 0xDE: '▐', 0xDF: '▀',
+		0xE0: 'α', 0xE1: 'ß', 0xE2: 'Γ', 0xE3: 'π', 0xE4: 'Σ', 0xE5: 'σ',
+		0xE6: 'µ', 0xE7: 'τ', 0xE8: 'Φ', 0xE9: 'Θ', 0xEA: 'Ω', 0xEB: 'δ',
+		0xEC: '∞', 0xED: 'φ', 0xEE: 'ε', 0xEF: '∩',
+		0xF0: '≡', 0xF1: '±', 0xF2: '≥', 0xF3: '≤', 0xF4: '⌠', 0xF5: '⌡',
+		0xF6: '÷', 0xF7: '≈', 0xF8: '°', 0xF9: '∙', 0xFA: '·', 0xFB: '√',
+		0xFC: 'ⁿ', 0xFD: '²', 0xFE: '■', 0xFF: '\u00A0',
+	}
+	if r, ok := cp437[b]; ok {
+		return r
+	}
+	if b >= 0x21 && b <= 0x7E {
+		return rune(b) // standard ASCII
+	}
+	return '?'
+}
