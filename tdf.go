@@ -266,11 +266,20 @@ func RenderString(f *Font, s string, letterSpacing int) string {
 				b.WriteString(strings.Repeat(" ", g.Width))
 				continue
 			}
-			for _, cell := range g.Rows[row] {
+			// TDF rows store only up to the last non-blank cell, so a row
+			// can be shorter than the glyph's declared width. We must pad
+			// it out to g.Width here — otherwise the next glyph's row would
+			// start at a column that varies row-by-row, producing a
+			// diagonal "slant" across the rendered word. -- claude, 2026-05-16
+			cells := g.Rows[row]
+			for _, cell := range cells {
 				fg := cgaColor(cell.Attr & 0x0F)
 				bg := cgaColor((cell.Attr >> 4) & 0x07)
 				ch := cp437Rune(cell.Char)
 				b.WriteString(lipgloss.NewStyle().Foreground(fg).Background(bg).Render(string(ch)))
+			}
+			if pad := g.Width - len(cells); pad > 0 {
+				b.WriteString(strings.Repeat(" ", pad))
 			}
 		}
 		lines[row] = b.String()
