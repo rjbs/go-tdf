@@ -194,6 +194,31 @@ func spaceWidth(f *Font) int {
 // common rendering of these fonts in TheDraw.
 const defaultAttr byte = 0x0F
 
+// outlineChars maps the Outline-font "drawing alphabet" (cell byte values
+// 0x40..0x4F) to the CP437 characters TheDraw substitutes at render time.
+// '@' is "outside the letter" (space); 'O' is the interior fill (0xF7 '≈');
+// the rest are corners and edges using a mix of single- and double-line
+// box-drawing characters, which together produce the stylised "outline"
+// look TheDraw is named for. -- claude, 2026-05-16
+var outlineChars = [16]byte{
+	/* @ */ 0x20,
+	/* A */ 0xCD, /* B */ 0xC4, /* C */ 0xB3, /* D */ 0xBA,
+	/* E */ 0xD5, /* F */ 0xBB, /* G */ 0xD6, /* H */ 0xBF,
+	/* I */ 0xC8, /* J */ 0xBE, /* K */ 0xC0, /* L */ 0xBD,
+	/* M */ 0xB5, /* N */ 0xC7, /* O */ 0xF7,
+}
+
+// outlineCellChar translates a raw Outline-font cell byte into the CP437
+// byte that should appear on screen. Bytes outside the drawing alphabet
+// are passed through unchanged, so the occasional non-conforming font
+// still produces *something* readable rather than vanishing.
+func outlineCellChar(b byte) byte {
+	if b >= 0x40 && b <= 0x4F {
+		return outlineChars[b-0x40]
+	}
+	return b
+}
+
 func parseGlyph(data []byte, pos int, fontType byte) (*Glyph, int, error) {
 	if pos+2 > len(data) {
 		return nil, 0, fmt.Errorf("glyph preamble truncated")
@@ -234,7 +259,11 @@ func parseGlyph(data []byte, pos int, fontType byte) (*Glyph, int, error) {
 				attr = data[pos]
 				pos++
 			}
-			row = append(row, Cell{Char: b, Attr: attr})
+			ch := b
+			if fontType == 0 {
+				ch = outlineCellChar(b)
+			}
+			row = append(row, Cell{Char: ch, Attr: attr})
 		}
 	}
 	return nil, 0, fmt.Errorf("glyph not terminated")
