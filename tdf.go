@@ -7,9 +7,11 @@
 //       • 6 bytes of metadata (type, letter spacing, block size, …)
 //       • 95 × 2-byte LE offset table (chars 32–126; 0xFFFF = undefined)
 //       • Character data section (offsets are relative to this section's start)
-//   - Each character: 2-byte (width, height) preamble,
-//       then rows of (cp437_char, cga_attr) pairs,
-//       0x0D row delimiter, 0x00 character terminator.
+//   - Each character: 2-byte (width, height) preamble, then row data
+//       terminated by 0x0D (row delimiter) and 0x00 (glyph terminator).
+//       For Color fonts (type 2) row data is (cp437_char, cga_attr) pairs;
+//       for Outline (0) and Block (1) fonts it is plain CP437 bytes with
+//       no per-cell attribute.
 //   - Upper and lowercase letters share the same glyphs.
 //   - Space (char 32) offset points past end of char data — no glyph; use SpaceWidth.
 package tdf
@@ -160,7 +162,7 @@ func parseFont(data []byte, base int) (*Font, int, error) {
 		if abs+2 > len(data) {
 			continue
 		}
-		g, _, err := parseGlyph(data, abs)
+		g, _, err := parseGlyph(data, abs, fontType)
 		if err != nil {
 			continue
 		}
@@ -187,13 +189,26 @@ func spaceWidth(f *Font) int {
 	return total / count
 }
 
-func parseGlyph(data []byte, pos int) (*Glyph, int, error) {
+// Default CGA attribute used for cells in Outline and Block fonts, which do
+// not store a per-cell attribute. 0x0F = bright white on black, the most
+// common rendering of these fonts in TheDraw.
+const defaultAttr byte = 0x0F
+
+func parseGlyph(data []byte, pos int, fontType byte) (*Glyph, int, error) {
 	if pos+2 > len(data) {
 		return nil, 0, fmt.Errorf("glyph preamble truncated")
 	}
 	width := int(data[pos])
 	height := int(data[pos+1])
 	pos += 2
+
+	// Only Color fonts (type 2) store a CGA attribute byte after each
+	// character byte; Outline (0) and Block (1) fonts store a single byte
+	// per cell. The earlier always-pair logic was eating every other byte
+	// as a phantom attribute in non-Color fonts, which also let stray 0x0D
+	// or 0x00 bytes in those positions short-circuit rows or whole glyphs —
+	// hence the "total gibberish" symptom. -- claude, 2026-05-16
+	colorFont := fontType == 2
 
 	g := &Glyph{Width: width, Height: height}
 	var row []Cell
@@ -211,11 +226,14 @@ func parseGlyph(data []byte, pos int) (*Glyph, int, error) {
 			g.Rows = append(g.Rows, row)
 			row = nil
 		default:
-			if pos >= len(data) {
-				return nil, 0, fmt.Errorf("glyph attr byte missing")
+			attr := defaultAttr
+			if colorFont {
+				if pos >= len(data) {
+					return nil, 0, fmt.Errorf("glyph attr byte missing")
+				}
+				attr = data[pos]
+				pos++
 			}
-			attr := data[pos]
-			pos++
 			row = append(row, Cell{Char: b, Attr: attr})
 		}
 	}
