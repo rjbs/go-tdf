@@ -51,7 +51,7 @@ type Glyph struct {
 type Font struct {
 	Name          string
 	Type          byte // 0=Outline, 1=Block, 2=Color
-	LetterSpacing int
+	LetterSpacing int // columns to insert between adjacent glyphs
 	SpaceWidth    int // columns to emit for ASCII space (derived from context)
 	glyphs        [numChars]*Glyph
 }
@@ -124,13 +124,25 @@ func parseFont(data []byte, base int) (*Font, int, error) {
 	// Metadata: 8 bytes (file offsets 37–44).
 	//   Bytes 0–3: padding, unused.
 	//   Byte  4:   font type (00=Outline, 01=Block, 02=Color).
-	//   Byte  5:   letter spacing (0–40).
+	//   Byte  5:   letter spacing — see note below.
 	//   Bytes 6–7: block size, LE uint16 = total byte length of char data section.
 	if pos+8 > len(data) {
 		return nil, 0, fmt.Errorf("metadata truncated")
 	}
 	fontType := data[pos+4]
-	letterSpacing := int(data[pos+5])
+	// The stored letter-spacing byte appears to be a 1-indexed advance
+	// distance — i.e. one *more* than the desired inter-glyph column gap.
+	// Translating with abs(raw - 1) matches every reference rendering in
+	// a 1198-font corpus: the dominant stored=2 becomes a 1-col gap,
+	// stored=1 (e.g. HOARD) abuts into a continuous wall, and stored=0
+	// (the JSF* family, FRISTI) gets the small gap their previews show.
+	// We expose the translated value so callers see the literal gap to
+	// emit between glyphs. -- claude, 2026-05-16
+	raw := int(data[pos+5])
+	letterSpacing := raw - 1
+	if letterSpacing < 0 {
+		letterSpacing = -letterSpacing
+	}
 	charDataSize := int(binary.LittleEndian.Uint16(data[pos+6:]))
 	pos += 8
 
