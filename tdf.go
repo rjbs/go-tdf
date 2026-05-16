@@ -335,6 +335,17 @@ func RenderString(f *Font, s string, letterSpacing int) string {
 }
 
 // cgaColor maps a 4-bit CGA color index to a lipgloss Color.
+//
+// These are the canonical IBM CGA RGB values rather than ANSI palette
+// indices (0..15). Using fixed hex means a real DOS box's colors come
+// out the same on every terminal, regardless of the user's theme.
+//
+// The tdfiglet reference renderer instead emits ANSI SGR codes (30-37,
+// 90-97), which lets the terminal's own theme decide the actual RGB —
+// usually producing noticeably *lighter* output, since most modern
+// themes brighten the "light" CGA slots well past #AAAAAA/#FFFFFF.
+// Both are defensible; we picked authenticity over theme-conformance.
+// -- claude, 2026-05-16
 func cgaColor(idx byte) lipgloss.Color {
 	palette := [16]lipgloss.Color{
 		"#000000", "#0000AA", "#00AA00", "#00AAAA",
